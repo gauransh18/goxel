@@ -19,6 +19,7 @@
 #include "goxel.h"
 
 #include "file_format.h"
+#include "script.h"
 
 #include "../ext_src/quickjs/quickjs.h"
 #include "../ext_src/quickjs/quickjs-libc.h"
@@ -859,22 +860,87 @@ static void init_runtime(void)
     JS_FreeValue(ctx, global_obj);
 }
 
-static int script_run_from_str(
+int script_run_from_str(
         const char *script, int len, const char *filename, int argc,
         const char **argv)
 {
     int ret = 0;
     JSValue val;
+    int old_count;
+    int cur_count;
+    int i, j;
 
     init_runtime();
+    
+    // Remember how many scripts were registered before we evaluate the string
+    old_count = arrlen(g_scripts);
+    
     js_std_add_helpers(g_ctx, argc, (char**)argv);
 
-    val = JS_Eval(g_ctx, script, len, filename, JS_EVAL_TYPE_MODULE);
+    val = JS_Eval(g_ctx, script, len, filename, JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(val)) {
         js_std_dump_error(g_ctx);
         ret = -1;
     }
     JS_FreeValue(g_ctx, val);
+    
+    // Check if the script we evaluated just registered something
+    cur_count = arrlen(g_scripts);
+    if (cur_count > old_count && ret == 0) {
+        
+        // Save the raw text to the local source repo using the registered name
+        if (script && len > 0 && strcmp(filename, "Editor") == 0) {
+            char path[1024] = "";
+            char base[1024] = ".";
+            
+#ifdef _WIN32
+            #include <windows.h>
+            GetModuleFileNameA(NULL, base, sizeof(base));
+            for (int i = 0; base[i]; i++) {
+                if (base[i] == '\\') base[i] = '/';
+            }
+            char *last_slash = strrchr(base, '/');
+            if (last_slash) *last_slash = '\0';
+#else
+            // Fallback for Linux/Mac if needed (using readlink or similar, but default to relative '.' for now)
+            ssize_t s = readlink("/proc/self/exe", base, sizeof(base)-1);
+            if (s > 0) {
+                base[s] = '\0';
+                char *last_slash = strrchr(base, '/');
+                if (last_slash) *last_slash = '\0';
+            }
+#endif
+            
+            snprintf(path, sizeof(path), "%s/data/scripts/%s.js", base, g_scripts[cur_count - 1].name);
+            sys_make_dir(path); // Ensure the directory tree exists using the full file path
+            
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(script, 1, len, f);
+                fclose(f);
+                LOG_I("Script editor dynamically dumped payload to: %s", path);
+            } else {
+                LOG_E("Failed to open path for script saving: %s", path);
+            }
+        }
+
+        // Evaluate the newest one implicitly since the user just hit 'Execute'
+        script_execute(g_scripts[cur_count - 1].name);
+
+        // Deduplicate: If an older script shares the same name as our new ones, delete the old one
+        for (i = old_count; i < cur_count; i++) {
+            for (j = 0; j < i; j++) {
+                if (strcmp(g_scripts[j].name, g_scripts[i].name) == 0) {
+                    LOG_I("Removing duplicate script registration: %s", g_scripts[j].name);
+                    arrdel(g_scripts, j);
+                    i--; // Everything shifted left
+                    cur_count--;
+                    break;
+                }
+            }
+        }
+    }
+
     return ret;
 }
 
@@ -917,23 +983,62 @@ static int on_user_script(const char *dir, const char *name, void *user)
     return 0;
 }
 
-static int on_dir(void *arg, const char *path)
-{
-    LOG_I("Loading scripts from %s\n", path);
-    sys_list_dir(path, on_user_script, NULL);
-    return 0;
-}
+
 
 void script_init(void)
 {
+    char base[1024] = ".";
+    char path[1024];
+
+#ifdef _WIN32
+    #include <windows.h>
+    GetModuleFileNameA(NULL, base, sizeof(base));
+    for (int i = 0; base[i]; i++) {
+        if (base[i] == '\\') base[i] = '/';
+    }
+    char *last_slash = strrchr(base, '/');
+    if (last_slash) *last_slash = '\0';
+#else
+    ssize_t s = readlink("/proc/self/exe", base, sizeof(base)-1);
+    if (s > 0) {
+        base[s] = '\0';
+        char *last_slash = strrchr(base, '/');
+        if (last_slash) *last_slash = '\0';
+    }
+#endif
+
     assets_list("data/scripts/", NULL, on_script);
-    sys_iter_paths(SYS_LOCATION_CONFIG, SYS_DIR, "scripts", NULL, on_dir);
+    
+    snprintf(path, sizeof(path), "%s/data/scripts", base);
+    LOG_I("Loading scripts from %s\n", path);
+    sys_list_dir(path, on_user_script, NULL);
 }
 
 void script_release(void)
 {
     JS_FreeContext(g_ctx);
     JS_FreeRuntime(g_rt);
+}
+
+void script_reload(void)
+{
+    LOG_I("Reloading all scripts...");
+    // Free the dynamic array of script structures
+    if (g_scripts) {
+        // Free dynamically allocated things inside the script array if necessary (like strings)
+        // Note: the strings here are JSValues (execute_fn), but since we release 
+        // the entire QuickJS runtime below, they don't need explicit JS_FreeValue here
+        arrfree(g_scripts);
+        g_scripts = NULL;
+    }
+    
+    // Release the QuickJS scripts engine and reset its pointers
+    script_release();
+    g_ctx = NULL;
+    g_rt = NULL;
+    
+    // Call init and reload them
+    script_init();
 }
 
 void script_iter_all(void *user, void (*f)(void *user, const char *name))

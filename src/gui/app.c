@@ -56,25 +56,8 @@ void gui_debug_panel(void);
 void gui_export_panel(void);
 void gui_snap_panel(void);
 void gui_symmetry_panel(void);
+void gui_script_editor_panel(void);
 bool gui_rotation_bar(void);
-
-enum {
-    PANEL_NULL,
-    PANEL_TOOLS,
-    PANEL_PALETTE,
-    PANEL_EDIT,
-    PANEL_LAYERS,
-    PANEL_SNAP,
-    PANEL_SYMMETRY,
-    PANEL_VIEW,
-    PANEL_MATERIAL,
-    PANEL_LIGHT,
-    PANEL_CAMERAS,
-    PANEL_IMAGE,
-    PANEL_RENDER,
-    PANEL_EXPORT,
-    PANEL_DEBUG,
-};
 
 static struct {
     const char *name;
@@ -100,6 +83,7 @@ static struct {
 #if DEBUG
     [PANEL_DEBUG]       = {N_("Debug"), ICON_DEBUG, gui_debug_panel},
 #endif
+    [PANEL_SCRIPT_EDITOR] = {N_("Script Editor"), ICON_EXPORT, gui_script_editor_panel},
 };
 
 typedef struct filter_layout_state filter_layout_state_t;
@@ -120,6 +104,7 @@ static void render_left_panel(void)
     bool selected;
 
     for (i = 1; i < (int)ARRAY_SIZE(PANELS); i++) {
+        if (!PANELS[i].name) continue;
         selected = (goxel.gui.current_panel == i);
         if (gui_tab(tr(PANELS[i].name), PANELS[i].icon, &selected)) {
             on_click();
@@ -221,23 +206,30 @@ void gui_app(void)
     x += gui_window_end().w + spacing;
 
     if (goxel.gui.current_panel) {
-        name = tr(PANELS[goxel.gui.current_panel].name);
-        flags = gui_window_begin(
-                name, x, y, goxel.gui.panel_width, 0, GUI_WINDOW_MOVABLE);
-        if (gui_panel_header(name))
-            goxel.gui.current_panel = 0;
-        else
-            PANELS[goxel.gui.current_panel].fn();
-        gui_window_end();
+        if (PANELS[goxel.gui.current_panel].name) {
+            name = tr(PANELS[goxel.gui.current_panel].name);
+            float h = goxel.screen_size[1] - y;
+            if (goxel.gui.current_panel == PANEL_SCRIPT_EDITOR && goxel.gui.panel_width < 400)
+                goxel.gui.panel_width = 400;
+            flags = gui_window_begin(
+                    name, x, y, goxel.gui.panel_width, h, 0);
+            if (gui_panel_header(name))
+                goxel.gui.current_panel = 0;
+            else
+                PANELS[goxel.gui.current_panel].fn();
+            gui_window_end();
 
-        if (flags & GUI_WINDOW_MOVED) {
-            PANELS[goxel.gui.current_panel].detached = true;
+            if (flags & GUI_WINDOW_MOVED) {
+                PANELS[goxel.gui.current_panel].detached = true;
+                goxel.gui.current_panel = 0;
+            }
+        } else {
             goxel.gui.current_panel = 0;
         }
     }
 
     for (i = 0; i < ARRAY_SIZE(PANELS); i++) {
-        if (!PANELS[i].detached) continue;
+        if (!PANELS[i].detached || !PANELS[i].name) continue;
         name = tr(PANELS[i].name);
         gui_window_begin(name, 0, 0, goxel.gui.panel_width, 0,
                          GUI_WINDOW_MOVABLE);

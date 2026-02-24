@@ -118,9 +118,11 @@ if target_os == 'msys' or target_os == 'cygwin':
     env.Append(CCFLAGS=['-Wno-error=address']) # To remove if possible.
     env.Append(LIBS=['glfw3', 'opengl32', 'z', 'tre', 'gdi32', 'Comdlg32',
                      'ole32', 'uuid', 'shell32'],
-               LINKFLAGS='--static')
+               LINKFLAGS=['--static', '-mwindows'])
     sources += glob.glob('ext_src/glew/glew.c')
     sources.append('ext_src/nfd/nfd_win.cpp')
+    env.Command('src/goxel_res.o', 'src/goxel.rc', 'windres $SOURCE -O coff -o $TARGET')
+    sources.append('src/goxel_res.o')
     env.Append(CPPPATH=['ext_src/glew'])
     env.Append(CPPDEFINES=['GLEW_STATIC', 'FREE_WINDOWS'])
 

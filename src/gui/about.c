@@ -17,6 +17,7 @@
  */
 
 #include "goxel.h"
+#include "script.h"
 
 int gui_about_popup(void *data)
 {
@@ -66,4 +67,26 @@ int gui_about_scripts_popup(void *data)
     gui_text("Add your own scripts in the directory:\n%s.", dir);
     gui_text("See some examples at %s.", examples_url);
     return gui_button("OK", 0, 0);
+}
+
+static char g_script_editor_buf[16384] = "";
+
+void gui_script_editor_panel(void)
+{
+    bool req_run = false;
+
+    // Provide a reasonably sized multiline text editor area
+    gui_input_text_multiline("##ScriptSource", g_script_editor_buf,
+                             sizeof(g_script_editor_buf), -1, -50);
+
+    // Execute button
+    if (gui_button("Execute", -1, 0)) {
+        req_run = true;
+    }
+
+    // Run the script
+    if (req_run && strlen(g_script_editor_buf) > 0) {
+        script_run_from_str(g_script_editor_buf, strlen(g_script_editor_buf),
+                            "Editor", 0, NULL);
+    }
 }

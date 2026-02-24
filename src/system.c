@@ -153,7 +153,15 @@ int sys_make_dir(const char *path)
     for (p = tmp + 1; *p; p++) {
         if (*p != '/') continue;
         *p = '\0';
-        if ((mkdir(tmp, S_IRWXU) != 0) && (errno != EEXIST)) return -1;
+        if ((mkdir(tmp, S_IRWXU) != 0) && (errno != EEXIST)) {
+#if defined(WIN32) || defined(_WIN32)
+            if (p - tmp == 2 && tmp[1] == ':') {
+                *p = '/';
+                continue;
+            }
+#endif
+            return -1;
+        }
         *p = '/';
     }
     return 0;

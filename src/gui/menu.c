@@ -26,6 +26,7 @@
 int gui_settings_popup(void *data);
 int gui_about_popup(void *data);
 int gui_about_scripts_popup(void *data);
+void gui_script_editor_panel(void);
 
 static void import_image_plane(void)
 {
@@ -156,6 +157,10 @@ void gui_menu(void)
     if (gui_menu_begin("Scripts", true)) {
         if (gui_menu_item(0, "About Scripts", true))
             gui_open_popup("Scripts", 0, NULL, gui_about_scripts_popup);
+        if (gui_menu_item(0, "Reload Scripts", true))
+            script_reload();
+        if (gui_menu_item(0, "Script Editor...", true))
+            goxel.gui.current_panel = PANEL_SCRIPT_EDITOR;
         script_iter_all(NULL, on_script);
         gui_menu_end();
     }

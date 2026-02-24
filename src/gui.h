@@ -39,6 +39,25 @@ enum {
     GUI_WINDOW_MOVED                    = 1 << 2,
 };
 
+enum {
+    PANEL_NULL,
+    PANEL_TOOLS,
+    PANEL_PALETTE,
+    PANEL_EDIT,
+    PANEL_LAYERS,
+    PANEL_SNAP,
+    PANEL_SYMMETRY,
+    PANEL_VIEW,
+    PANEL_MATERIAL,
+    PANEL_LIGHT,
+    PANEL_CAMERAS,
+    PANEL_IMAGE,
+    PANEL_RENDER,
+    PANEL_EXPORT,
+    PANEL_DEBUG,
+    PANEL_SCRIPT_EDITOR,
+};
+
 typedef struct {
     float h;
     float w;

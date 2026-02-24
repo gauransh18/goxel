@@ -28,6 +28,11 @@ int script_run_from_file(const char *filename, int argc, const char **argv);
 void script_init(void);
 
 /*
+ * Reload all scripts dynamically.
+ */
+void script_reload(void);
+
+/*
  * List all the registered scripts to show in the script menu.
  */
 void script_iter_all(void *user, void (*f)(void *user, const char *name));
@@ -37,5 +42,11 @@ void script_iter_all(void *user, void (*f)(void *user, const char *name));
  */
 int script_execute(const char *name);
 
+/*
+ * Execute arbitrary JavaScript from a string.
+ */
+int script_run_from_str(
+        const char *script, int len, const char *filename, int argc,
+        const char **argv);
 
 #endif // SCRIPT_H
