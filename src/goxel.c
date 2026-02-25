@@ -1392,7 +1392,7 @@ int goxel_import_file(const char *path, const char *format)
     image_was_empty = image_is_empty(goxel.image);
 
     f = file_format_get(path, format, "r");
-    if (str_endswith(path, ".gox")) {
+    if (path && str_endswith(path, ".gox")) {
         err = load_from_file(path, false);
     } else {
         if (!f) return -1;

@@ -30,6 +30,11 @@
 static JSRuntime *g_rt = NULL;
 static JSContext *g_ctx = NULL;
 
+static int build_script_path(char *path, size_t size, const char *base,
+                             const char *name);
+static int join_dir_file(char *path, size_t size, const char *dir,
+                         const char *name);
+
 typedef struct klass klass_t;
 typedef struct attribute attribute_t;
 
@@ -527,27 +532,27 @@ static JSValue js_palette_get_color(JSContext *ctx, JSValueConst this_val, int m
 {
     js_palette_t *js_palette;
     uint8_t *color;
-    
+
     js_palette = JS_GetOpaque2(ctx, this_val, palette_klass.id);
     if (!js_palette) {
         LOG_E("Error in palette_get_color: No palette object found");
         return JS_EXCEPTION;
     }
-    
+
     color = goxel.painter.color;
-    
+
     // If we already have a color vec, free it first to prevent memory leaks
     if (!JS_IsUndefined(js_palette->color_vec)) {
         JS_FreeValue(ctx, js_palette->color_vec);
     }
-    
+
     // Create a new vec and store it in our js_palette struct
     js_palette->color_vec = new_js_vec4(ctx, color[0], color[1], color[2], color[3]);
-    
+
     return JS_DupValue(ctx, js_palette->color_vec);
 }
 
-static JSValue js_palette_set_color(JSContext *ctx, JSValueConst this_val, 
+static JSValue js_palette_set_color(JSContext *ctx, JSValueConst this_val,
                                     JSValueConst val, int magic)
 {
     js_palette_t *js_palette;
@@ -578,30 +583,30 @@ static JSValue js_palette_set_color(JSContext *ctx, JSValueConst this_val,
 static void js_palette_finalizer(JSRuntime *rt, JSValue this_val)
 {
     js_palette_t *js_palette;
-    
+
     js_palette = JS_GetOpaque(this_val, palette_klass.id);
     if (!js_palette)
         return;
 
     LOG_I("Palette finalizer called for palette at %p", (void*)js_palette);
-    
+
     if (!JS_IsUndefined(js_palette->color_vec)) {
         JS_FreeValueRT(rt, js_palette->color_vec);
     }
-    
+
     js_free_rt(rt, js_palette);
 }
 
-static JSValue js_palette_from_ptr(JSContext *ctx, JSValueConst owner, 
+static JSValue js_palette_from_ptr(JSContext *ctx, JSValueConst owner,
                                    void *ptr, size_t size)
 {
     JSValue ret;
     js_palette_t *js_palette;
-    
+
     js_palette = js_mallocz(ctx, sizeof(*js_palette));
     js_palette->palette = ptr;
     js_palette->color_vec = JS_UNDEFINED;
-    
+
     ret = JS_NewObjectClass(ctx, palette_klass.id);
     JS_SetOpaque(ret, js_palette);
     return ret;
@@ -612,7 +617,7 @@ static klass_t palette_klass = {
     .def.finalizer = js_palette_finalizer,
     .ctor_from_ptr = js_palette_from_ptr,
     .attributes = {
-        {"color", .get=js_palette_get_color, .set=js_palette_set_color, 
+        {"color", .get=js_palette_get_color, .set=js_palette_set_color,
             .magic=0},
         { .name = NULL }
     }
@@ -749,7 +754,7 @@ static JSValue attr_getter(JSContext *ctx, JSValueConst this_val, int magic)
         JS_FreeValue(ctx, proto);
         return JS_EXCEPTION;
     }
-    
+
     this = JS_GetOpaque(this_val, klass->id);
     JS_FreeValue(ctx, proto);
     attr = &klass->attributes[magic];
@@ -758,12 +763,12 @@ static JSValue attr_getter(JSContext *ctx, JSValueConst this_val, int magic)
         LOG_E("No object instance found for class %s", klass->def.class_name);
         return JS_EXCEPTION;
     }
-    
+
     attr = &klass->attributes[magic];
-    
+
     assert(this);
     if (attr->klass && attr->klass->ctor_from_ptr && attr->member.size) {
-        ptr = (char*)this + attr->member.offset; 
+        ptr = (char*)this + attr->member.offset;
         ret = attr->klass->ctor_from_ptr(ctx, this_val, ptr, attr->member.size);
         return ret;
     }
@@ -871,10 +876,10 @@ int script_run_from_str(
     int i, j;
 
     init_runtime();
-    
+
     // Remember how many scripts were registered before we evaluate the string
     old_count = arrlen(g_scripts);
-    
+
     js_std_add_helpers(g_ctx, argc, (char**)argv);
 
     val = JS_Eval(g_ctx, script, len, filename, JS_EVAL_TYPE_GLOBAL);
@@ -883,16 +888,16 @@ int script_run_from_str(
         ret = -1;
     }
     JS_FreeValue(g_ctx, val);
-    
+
     // Check if the script we evaluated just registered something
     cur_count = arrlen(g_scripts);
     if (cur_count > old_count && ret == 0) {
-        
+
         // Save the raw text to the local source repo using the registered name
         if (script && len > 0 && strcmp(filename, "Editor") == 0) {
             char path[1024] = "";
             char base[1024] = ".";
-            
+
 #ifdef _WIN32
             #include <windows.h>
             GetModuleFileNameA(NULL, base, sizeof(base));
@@ -910,19 +915,24 @@ int script_run_from_str(
                 if (last_slash) *last_slash = '\0';
             }
 #endif
-            
-            snprintf(path, sizeof(path), "%s/data/scripts/%s.js", base, g_scripts[cur_count - 1].name);
-            sys_make_dir(path); // Ensure the directory tree exists using the full file path
-            
-            FILE *f = fopen(path, "wb");
-            if (f) {
-                fwrite(script, 1, len, f);
-                fclose(f);
-                LOG_I("Script editor dynamically dumped payload to: %s", path);
+
+            if (!build_script_path(path, sizeof(path), base,
+                                   g_scripts[cur_count - 1].name)) {
+                LOG_E("Script path too long for base: %s", base);
             } else {
-                LOG_E("Failed to open path for script saving: %s", path);
+                sys_make_dir(path); // Ensure the directory tree exists using the full file path
+
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(script, 1, len, f);
+                    fclose(f);
+                    LOG_I("Script editor dynamically dumped payload to: %s", path);
+                } else {
+                    LOG_E("Failed to open path for script saving: %s", path);
+                }
             }
-        }
+
+         }
 
         // Evaluate the newest one implicitly since the user just hit 'Execute'
         script_execute(g_scripts[cur_count - 1].name);
@@ -976,7 +986,7 @@ static int on_user_script(const char *dir, const char *name, void *user)
     char *data;
     int size;
 
-    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    if (!join_dir_file(path, sizeof(path), dir, name)) return -1;
     data = read_file(path, &size);
     if (!data) return -1;
     script_run_from_str(data, strlen(data), path, 0, NULL);
@@ -1008,8 +1018,11 @@ void script_init(void)
 #endif
 
     assets_list("data/scripts/", NULL, on_script);
-    
-    snprintf(path, sizeof(path), "%s/data/scripts", base);
+
+    if (!build_script_path(path, sizeof(path), base, NULL)) {
+        LOG_E("Script directory path too long for base: %s", base);
+        return;
+    }
     LOG_I("Loading scripts from %s\n", path);
     sys_list_dir(path, on_user_script, NULL);
 }
@@ -1026,17 +1039,17 @@ void script_reload(void)
     // Free the dynamic array of script structures
     if (g_scripts) {
         // Free dynamically allocated things inside the script array if necessary (like strings)
-        // Note: the strings here are JSValues (execute_fn), but since we release 
+        // Note: the strings here are JSValues (execute_fn), but since we release
         // the entire QuickJS runtime below, they don't need explicit JS_FreeValue here
         arrfree(g_scripts);
         g_scripts = NULL;
     }
-    
+
     // Release the QuickJS scripts engine and reset its pointers
     script_release();
     g_ctx = NULL;
     g_rt = NULL;
-    
+
     // Call init and reload them
     script_init();
 }
@@ -1073,4 +1086,75 @@ int script_execute(const char *name)
     }
     JS_FreeValue(ctx, val);
     return ret;
+}
+
+int script_get_dir(char *buf, size_t size)
+{
+    char base[1024] = ".";
+
+#ifdef _WIN32
+    GetModuleFileNameA(NULL, base, sizeof(base));
+    for (int i = 0; base[i]; i++) {
+        if (base[i] == '\\') base[i] = '/';
+    }
+    char *last_slash = strrchr(base, '/');
+    if (last_slash) *last_slash = '\0';
+#else
+    ssize_t s = readlink("/proc/self/exe", base, sizeof(base)-1);
+    if (s > 0) {
+        base[s] = '\0';
+        char *last_slash = strrchr(base, '/');
+        if (last_slash) *last_slash = '\0';
+    }
+#endif
+
+    return build_script_path(buf, size, base, NULL);
+}
+
+static int build_script_path(char *path, size_t size, const char *base,
+                             const char *name)
+{
+    const char *dir = "/data/scripts";
+    const char *ext = ".js";
+    size_t base_len = strlen(base);
+    size_t dir_len = strlen(dir);
+    size_t name_len = name ? strlen(name) : 0;
+    size_t ext_len = name ? strlen(ext) : 0;
+    size_t total = base_len + dir_len + (name ? (1 + name_len + ext_len) : 0) + 1;
+
+    if (total > size) return 0;
+
+    char *p = path;
+    memcpy(p, base, base_len);
+    p += base_len;
+    memcpy(p, dir, dir_len);
+    p += dir_len;
+    if (name) {
+        *p++ = '/';
+        memcpy(p, name, name_len);
+        p += name_len;
+        memcpy(p, ext, ext_len);
+        p += ext_len;
+    }
+    *p = '\0';
+    return 1;
+}
+
+static int join_dir_file(char *path, size_t size, const char *dir,
+                         const char *name)
+{
+    size_t dir_len = strlen(dir);
+    size_t name_len = strlen(name);
+    size_t total = dir_len + 1 + name_len + 1;
+
+    if (total > size) return 0;
+
+    char *p = path;
+    memcpy(p, dir, dir_len);
+    p += dir_len;
+    *p++ = '/';
+    memcpy(p, name, name_len);
+    p += name_len;
+    *p = '\0';
+    return 1;
 }

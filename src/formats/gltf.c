@@ -20,6 +20,8 @@
 
 #include "file_format.h"
 #include "utils/vec.h"
+#include "utils/color.h"
+#include <math.h>
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
@@ -51,7 +53,9 @@ typedef struct {
     float simplify;
 } export_options_t;
 
-static export_options_t g_export_options = {};
+static export_options_t g_export_options = {
+    .vertex_color = true,
+};
 
 
 // Return the next power of 2 larger or equal to x.
@@ -432,6 +436,15 @@ static void gltf_export(const image_t *img, const char *path,
                    palette, palette_pix_size, options);
     }
 
+    if (path) {
+        const char *ext = strrchr(path, '.');
+        if (ext && strcasecmp(ext, ".glb") == 0) {
+            gltf_options.type = cgltf_file_type_glb;
+        } else if (ext && strcasecmp(ext, ".gltf") == 0) {
+            gltf_options.type = cgltf_file_type_gltf;
+        }
+    }
+
     cgltf_write_file(&gltf_options, path, g.data);
     cgltf_free(g.data);
     free(g.palette.entries);
@@ -454,11 +467,405 @@ static void export_gui(file_format_t *format)
                     0, 1, "%.1f");
 }
 
+// Import support
+
+typedef struct {
+    const cgltf_primitive *primitive;
+    cgltf_float world_matrix[16];
+} gltf_prim_ref_t;
+
+static bool append_prim_ref(gltf_prim_ref_t **items, size_t *len, size_t *cap,
+                            const cgltf_primitive *primitive,
+                            const cgltf_float world_matrix[16])
+{
+    gltf_prim_ref_t *new_items;
+    size_t new_cap;
+    if (*len >= *cap) {
+        new_cap = *cap ? *cap * 2 : 16;
+        new_items = realloc(*items, new_cap * sizeof(**items));
+        if (!new_items) return false;
+        *items = new_items;
+        *cap = new_cap;
+    }
+    (*items)[*len].primitive = primitive;
+    memcpy((*items)[*len].world_matrix, world_matrix, sizeof((*items)[*len].world_matrix));
+    (*len)++;
+    return true;
+}
+
+static size_t primitive_triangle_index_count(const cgltf_primitive *prim)
+{
+    size_t n;
+    if (!prim || !prim->indices) return 0;
+    n = prim->indices->count;
+    switch (prim->type) {
+    case cgltf_primitive_type_triangles:      return n;
+    case cgltf_primitive_type_triangle_strip: return n >= 3 ? (n - 2) * 3 : 0;
+    case cgltf_primitive_type_triangle_fan:   return n >= 3 ? (n - 2) * 3 : 0;
+    default:                                  return 0;
+    }
+}
+
+static void transform_point(const cgltf_float m[16],
+                            const cgltf_float in[3], cgltf_float out[3])
+{
+    out[0] = m[0] * in[0] + m[4] * in[1] + m[8]  * in[2] + m[12];
+    out[1] = m[1] * in[0] + m[5] * in[1] + m[9]  * in[2] + m[13];
+    out[2] = m[2] * in[0] + m[6] * in[1] + m[10] * in[2] + m[14];
+}
+
+static bool collect_node_primitives(const cgltf_node *node,
+                                    gltf_prim_ref_t **refs,
+                                    size_t *refs_len, size_t *refs_cap)
+{
+    size_t i;
+    cgltf_float world_matrix[16];
+    if (!node) return true;
+
+    if (node->mesh) {
+        cgltf_node_transform_world(node, world_matrix);
+        for (i = 0; i < node->mesh->primitives_count; i++) {
+            const cgltf_primitive *prim = &node->mesh->primitives[i];
+            const cgltf_accessor *pos_accessor;
+            if (!prim->indices) continue;
+            pos_accessor = cgltf_find_accessor(prim, cgltf_attribute_type_position, 0);
+            if (!pos_accessor) continue;
+            if (primitive_triangle_index_count(prim) == 0) continue;
+            if (!append_prim_ref(refs, refs_len, refs_cap, prim, world_matrix)) {
+                return false;
+            }
+        }
+    }
+
+    for (i = 0; i < node->children_count; i++) {
+        if (!collect_node_primitives(node->children[i], refs, refs_len, refs_cap)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool append_triangle_indices(uint32_t *dst, size_t *dst_offset,
+                                    const cgltf_uint *src, size_t src_count,
+                                    size_t base_vertex,
+                                    cgltf_primitive_type type)
+{
+    size_t k;
+    if (type == cgltf_primitive_type_triangles) {
+        for (k = 0; k < src_count; k++) {
+            dst[(*dst_offset)++] = (uint32_t)(base_vertex + src[k]);
+        }
+        return true;
+    }
+    if (type == cgltf_primitive_type_triangle_strip) {
+        for (k = 2; k < src_count; k++) {
+            if (k & 1) {
+                dst[(*dst_offset)++] = (uint32_t)(base_vertex + src[k - 1]);
+                dst[(*dst_offset)++] = (uint32_t)(base_vertex + src[k - 2]);
+                dst[(*dst_offset)++] = (uint32_t)(base_vertex + src[k]);
+            } else {
+                dst[(*dst_offset)++] = (uint32_t)(base_vertex + src[k - 2]);
+                dst[(*dst_offset)++] = (uint32_t)(base_vertex + src[k - 1]);
+                dst[(*dst_offset)++] = (uint32_t)(base_vertex + src[k]);
+            }
+        }
+        return true;
+    }
+    if (type == cgltf_primitive_type_triangle_fan) {
+        for (k = 2; k < src_count; k++) {
+            dst[(*dst_offset)++] = (uint32_t)(base_vertex + src[0]);
+            dst[(*dst_offset)++] = (uint32_t)(base_vertex + src[k - 1]);
+            dst[(*dst_offset)++] = (uint32_t)(base_vertex + src[k]);
+        }
+        return true;
+    }
+    return false;
+}
+
+static int gltf_import(const file_format_t *format, image_t *image,
+                       const char *path)
+{
+    cgltf_data *data = NULL;
+    cgltf_options options = {0};
+    cgltf_result result;
+    int i, pos[3];
+    uint8_t color[4];
+    volume_iterator_t iter = {0};
+    layer_t *layer;
+    size_t total_vertices = 0, total_indices = 0;
+    float *all_vertices = NULL;
+    uint8_t *all_colors = NULL;
+    uint32_t *all_indices = NULL;
+    size_t vertex_offset = 0, index_offset = 0;
+    gltf_prim_ref_t *prim_refs = NULL;
+    size_t prim_refs_len = 0, prim_refs_cap = 0;
+    size_t node_idx, ref_idx;
+
+    if (!path) {
+        LOG_E("glTF import: NULL path");
+        return -1;
+    }
+
+    // Parse the glTF/GLB file
+    result = cgltf_parse_file(&options, path, &data);
+    if (result != cgltf_result_success || !data) {
+        LOG_E("Failed to parse glTF file: %s (error %d)", path, (int)result);
+        return -1;
+    }
+
+    // Validate the parsed data
+    result = cgltf_validate(data);
+    if (result != cgltf_result_success) {
+        LOG_W("glTF validation warning (error %d), attempting to continue",
+              (int)result);
+    }
+
+    // Load the buffer data (base64, external .bin, or GLB binary chunk)
+    result = cgltf_load_buffers(&options, data, path);
+    if (result != cgltf_result_success) {
+        LOG_E("Failed to load glTF buffers (error %d)", (int)result);
+        cgltf_free(data);
+        return -1;
+    }
+
+    // Collect primitives from all scenes/nodes
+    if (data->scene && data->scene->nodes_count > 0 && data->scene->nodes) {
+        for (node_idx = 0; node_idx < data->scene->nodes_count; node_idx++) {
+            if (!data->scene->nodes[node_idx]) continue;
+            if (!collect_node_primitives(data->scene->nodes[node_idx],
+                                         &prim_refs, &prim_refs_len,
+                                         &prim_refs_cap)) {
+                LOG_E("Failed to collect glTF primitives from default scene");
+                goto fail;
+            }
+        }
+    } else {
+        // Fallback: try all nodes at root level
+        for (node_idx = 0; node_idx < data->nodes_count; node_idx++) {
+            if (!collect_node_primitives(&data->nodes[node_idx],
+                                         &prim_refs, &prim_refs_len,
+                                         &prim_refs_cap)) {
+                LOG_E("Failed to collect glTF primitives from nodes");
+                goto fail;
+            }
+        }
+    }
+
+    if (prim_refs_len == 0) {
+        LOG_E("No mesh primitives found in glTF file: %s", path);
+        goto fail;
+    }
+
+    // Count totals for allocation
+    for (ref_idx = 0; ref_idx < prim_refs_len; ref_idx++) {
+        const cgltf_primitive *prim = prim_refs[ref_idx].primitive;
+        const cgltf_accessor *pos_accessor;
+        if (!prim || !prim->indices) continue;
+        pos_accessor = cgltf_find_accessor(prim,
+                                           cgltf_attribute_type_position, 0);
+        if (!pos_accessor) continue;
+        total_vertices += pos_accessor->count;
+        total_indices += primitive_triangle_index_count(prim);
+    }
+
+    if (total_vertices == 0 || total_indices == 0) {
+        LOG_E("No mesh data found in glTF file");
+        goto fail;
+    }
+
+    all_vertices = calloc(total_vertices * 3, sizeof(float));
+    all_colors = calloc(total_vertices * 3, sizeof(uint8_t));
+    all_indices = calloc(total_indices, sizeof(uint32_t));
+
+    if (!all_vertices || !all_indices || !all_colors) {
+        LOG_E("Failed to allocate memory for glTF mesh data");
+        goto fail;
+    }
+
+    // Read vertex data from each primitive
+    for (ref_idx = 0; ref_idx < prim_refs_len; ref_idx++) {
+        const cgltf_primitive *prim = prim_refs[ref_idx].primitive;
+        const cgltf_accessor *pos_accessor;
+        const cgltf_accessor *color_accessor;
+        cgltf_uint *raw_indices = NULL;
+        size_t local_vertex_count, local_index_count;
+        size_t local_v;
+
+        if (!prim || !prim->indices) continue;
+
+        pos_accessor = cgltf_find_accessor(prim,
+                                           cgltf_attribute_type_position, 0);
+        if (!pos_accessor) continue;
+
+        color_accessor = cgltf_find_accessor(prim,
+                                             cgltf_attribute_type_color, 0);
+
+        local_vertex_count = pos_accessor->count;
+        local_index_count = prim->indices->count;
+
+        // Read positions and colors
+        for (local_v = 0; local_v < local_vertex_count; local_v++) {
+            cgltf_float p_in[3] = {0};
+            cgltf_float p_world[3] = {0};
+            cgltf_float c_in[4] = {1, 1, 1, 1};
+            size_t dst_v = vertex_offset + local_v;
+
+            if (dst_v * 3 + 2 >= total_vertices * 3) break;
+
+            if (!cgltf_accessor_read_float(pos_accessor, local_v, p_in, 3))
+                continue;
+            transform_point(prim_refs[ref_idx].world_matrix, p_in, p_world);
+            all_vertices[dst_v * 3 + 0] = p_world[0];
+            all_vertices[dst_v * 3 + 1] = p_world[1];
+            all_vertices[dst_v * 3 + 2] = p_world[2];
+
+            if (color_accessor &&
+                cgltf_accessor_read_float(color_accessor, local_v, c_in, 4)) {
+                float r = c_in[0], g = c_in[1], b = c_in[2];
+                if (r < 0) r = 0;
+                if (r > 1) r = 1;
+                if (g < 0) g = 0;
+                if (g > 1) g = 1;
+                if (b < 0) b = 0;
+                if (b > 1) b = 1;
+                // glTF vertex colors are in linear space; convert to sRGB.
+                float lin[3] = {r, g, b};
+                uint8_t srgb[3];
+                rgb_to_srgb8(lin, srgb);
+                all_colors[dst_v * 3 + 0] = srgb[0];
+                all_colors[dst_v * 3 + 1] = srgb[1];
+                all_colors[dst_v * 3 + 2] = srgb[2];
+            } else {
+                // Try to get color from material base color (also linear)
+                if (prim->material &&
+                    prim->material->has_pbr_metallic_roughness) {
+                    float *bc = prim->material->pbr_metallic_roughness
+                                    .base_color_factor;
+                    float lin[3] = {
+                        fminf(fmaxf(bc[0], 0), 1),
+                        fminf(fmaxf(bc[1], 0), 1),
+                        fminf(fmaxf(bc[2], 0), 1)
+                    };
+                    uint8_t srgb[3];
+                    rgb_to_srgb8(lin, srgb);
+                    all_colors[dst_v * 3 + 0] = srgb[0];
+                    all_colors[dst_v * 3 + 1] = srgb[1];
+                    all_colors[dst_v * 3 + 2] = srgb[2];
+                } else {
+                    all_colors[dst_v * 3 + 0] = 255;
+                    all_colors[dst_v * 3 + 1] = 255;
+                    all_colors[dst_v * 3 + 2] = 255;
+                }
+            }
+        }
+
+        // Read and expand indices
+        raw_indices = malloc(local_index_count * sizeof(*raw_indices));
+        if (!raw_indices) goto fail;
+        if (cgltf_accessor_unpack_indices(prim->indices, raw_indices,
+                                          sizeof(*raw_indices),
+                                          local_index_count) == 0) {
+            free(raw_indices);
+            vertex_offset += local_vertex_count;
+            continue;
+        }
+
+        if (!append_triangle_indices(all_indices, &index_offset,
+                                     raw_indices, local_index_count,
+                                     vertex_offset, prim->type)) {
+            free(raw_indices);
+            vertex_offset += local_vertex_count;
+            continue;
+        }
+        free(raw_indices);
+        vertex_offset += local_vertex_count;
+    }
+
+    if (index_offset == 0) {
+        LOG_E("No valid triangle indices found in glTF");
+        goto fail;
+    }
+
+    // Direct voxel extraction from mesh triangles.
+    layer = image_add_layer(image, NULL);
+    for (i = 0; (size_t)(i + 2) < index_offset; i += 3) {
+        uint32_t i0 = all_indices[i];
+        uint32_t i1 = all_indices[i + 1];
+        uint32_t i2 = all_indices[i + 2];
+        float v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z;
+        float cx, cy, cz;
+        float e1x, e1y, e1z, e2x, e2y, e2z;
+        float nx, ny, nz, len;
+        float vcx, vcy, vcz;
+
+        if (i0 >= vertex_offset || i1 >= vertex_offset || i2 >= vertex_offset)
+            continue;
+
+        v0x = all_vertices[i0*3+0]; v0y = all_vertices[i0*3+1];
+        v0z = all_vertices[i0*3+2];
+        v1x = all_vertices[i1*3+0]; v1y = all_vertices[i1*3+1];
+        v1z = all_vertices[i1*3+2];
+        v2x = all_vertices[i2*3+0]; v2y = all_vertices[i2*3+1];
+        v2z = all_vertices[i2*3+2];
+
+        // Centroid in glTF world space (Y-up)
+        cx = (v0x + v1x + v2x) / 3.0f;
+        cy = (v0y + v1y + v2y) / 3.0f;
+        cz = (v0z + v1z + v2z) / 3.0f;
+
+        // Face normal via cross product
+        e1x = v1x - v0x; e1y = v1y - v0y; e1z = v1z - v0z;
+        e2x = v2x - v0x; e2y = v2y - v0y; e2z = v2z - v0z;
+        nx = e1y * e2z - e1z * e2y;
+        ny = e1z * e2x - e1x * e2z;
+        nz = e1x * e2y - e1y * e2x;
+        len = sqrtf(nx * nx + ny * ny + nz * nz);
+        if (len > 1e-6f) {
+            nx /= len;
+            ny /= len;
+            nz /= len;
+        }
+
+        // Step back half unit along normal -> voxel center
+        vcx = cx - nx * 0.5f;
+        vcy = cy - ny * 0.5f;
+        vcz = cz - nz * 0.5f;
+
+        // glTF Y-up (x,y,z) -> Goxel Z-up (x, -z, y)
+        pos[0] = (int)floorf(vcx);
+        pos[1] = (int)floorf(-vcz);
+        pos[2] = (int)floorf(vcy);
+
+        color[0] = all_colors[i0 * 3 + 0];
+        color[1] = all_colors[i0 * 3 + 1];
+        color[2] = all_colors[i0 * 3 + 2];
+        color[3] = 255;
+        volume_set_at(layer->volume, &iter, pos, color);
+    }
+
+    free(all_vertices);
+    free(all_colors);
+    free(all_indices);
+    free(prim_refs);
+    cgltf_free(data);
+
+    return 0;
+
+fail:
+    free(all_vertices);
+    free(all_colors);
+    free(all_indices);
+    free(prim_refs);
+    if (data) cgltf_free(data);
+    return -1;
+}
+
 FILE_FORMAT_REGISTER(gltf,
     .name = "gltf",
-    .exts = {"*.gltf"},
-    .exts_desc = "glTF2",
+    .exts = {"*.gltf", "*.glb"},
+    .exts_desc = "glTF",
     .export_gui = export_gui,
     .export_func = export_as_gltf,
+    .import_func = gltf_import,
     .priority = 100,
 )
