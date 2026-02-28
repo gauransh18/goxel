@@ -49,8 +49,17 @@ void on_char(GLFWwindow *win, unsigned int c)
 void on_drop(GLFWwindow* win, int count, const char** paths)
 {
     int i;
-    for (i = 0;  i < count;  i++)
-        goxel_import_file(paths[i], NULL);
+    for (i = 0;  i < count;  i++) {
+        if (str_endswith(paths[i], ".gox")) {
+            image_delete(goxel.image);
+            goxel.image = image_new();
+            load_from_file(paths[i], true);
+        } else {
+            image_delete(goxel.image);
+            goxel.image = image_new();
+            goxel_import_file(paths[i], NULL);
+        }
+    }
 }
 
 void on_close(GLFWwindow *win)
@@ -64,6 +73,7 @@ typedef struct
     char *input;
     char *export;
     float scale;
+    bool register_assoc;
 
     const char *script;
     int script_args_nb;
@@ -73,6 +83,7 @@ typedef struct
 #define OPT_HELP 1
 #define OPT_VERSION 2
 #define OPT_SCRIPT 3
+#define OPT_REGISTER 4
 
 typedef struct {
     const char *name;
@@ -88,6 +99,8 @@ static const gox_option_t OPTIONS[] = {
     {"scale", 's', required_argument, "FLOAT", .help="Set UI scale"},
     {"script", OPT_SCRIPT, required_argument, "FILENAME",
         .help="Run a script and exit"},
+    {"register", OPT_REGISTER,
+        .help="Register file associations (.gltf, .glb, .fbx) on Windows"},
     {"help", OPT_HELP, .help="Give this help list"},
     {"version", OPT_VERSION, .help="Print program version"},
     {}
@@ -152,6 +165,9 @@ static void parse_options(int argc, char **argv, args_t *args)
             exit(0);
         case OPT_SCRIPT:
             args->script = optarg;
+            break;
+        case OPT_REGISTER:
+            args->register_assoc = true;
             break;
         case '?':
             exit(-1);
@@ -289,6 +305,69 @@ static void set_clipboard_text(void *user, const char *text)
     glfwSetClipboardString(window, text);
 }
 
+#ifdef WIN32
+#include <windows.h>
+#include <shlobj.h>
+static void register_file_associations(void)
+{
+    char exe_path[MAX_PATH];
+    char cmd[MAX_PATH + 16];
+    HKEY hkey;
+    LONG res;
+    static const char *exts[] = {
+        ".gltf", ".glb", ".fbx", ".gox", ".vox", ".obj", NULL
+    };
+    int i;
+
+    if (!GetModuleFileNameA(NULL, exe_path, sizeof(exe_path))) {
+        fprintf(stderr, "Failed to get executable path\\n");
+        return;
+    }
+    snprintf(cmd, sizeof(cmd), "\"%s\" \"%%1\"", exe_path);
+
+    // Create the Goxel application class
+    res = RegCreateKeyExA(HKEY_CURRENT_USER,
+            "Software\\Classes\\Goxel.File\\shell\\open\\command",
+            0, NULL, 0, KEY_WRITE, NULL, &hkey, NULL);
+    if (res == ERROR_SUCCESS) {
+        RegSetValueExA(hkey, NULL, 0, REG_SZ,
+                       (const BYTE*)cmd, (DWORD)strlen(cmd) + 1);
+        RegCloseKey(hkey);
+    }
+
+    // Set friendly name
+    res = RegCreateKeyExA(HKEY_CURRENT_USER,
+            "Software\\Classes\\Goxel.File",
+            0, NULL, 0, KEY_WRITE, NULL, &hkey, NULL);
+    if (res == ERROR_SUCCESS) {
+        const char *name = "Goxel Voxel File";
+        RegSetValueExA(hkey, NULL, 0, REG_SZ,
+                       (const BYTE*)name, (DWORD)strlen(name) + 1);
+        RegCloseKey(hkey);
+    }
+
+    // Associate each extension
+    for (i = 0; exts[i]; i++) {
+        char key[256];
+        snprintf(key, sizeof(key), "Software\\Classes\\%s", exts[i]);
+        res = RegCreateKeyExA(HKEY_CURRENT_USER, key,
+                0, NULL, 0, KEY_WRITE, NULL, &hkey, NULL);
+        if (res == ERROR_SUCCESS) {
+            const char *val = "Goxel.File";
+            RegSetValueExA(hkey, NULL, 0, REG_SZ,
+                           (const BYTE*)val, (DWORD)strlen(val) + 1);
+            RegCloseKey(hkey);
+        }
+    }
+
+    // Notify the shell of the change
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+    printf("File associations registered for: .gltf .glb .fbx .gox .vox .obj\\n");
+    printf("You can now right-click these files and choose 'Open with' > Goxel,\\n");
+    printf("or they will open in Goxel by default.\\n");
+}
+#endif
+
 static void filters_to_nfd_spec(
         const char *const *filters, char buf[], size_t buf_size)
 {
@@ -297,6 +376,8 @@ static void filters_to_nfd_spec(
 
     buf[0] = '\0';
     for (i = 0; filters[i]; i++) {
+        if (i > 0 && len < buf_size - 1)
+            len += snprintf(buf + len, buf_size - len, ",");
         len += snprintf(buf + len, buf_size - len, "%s", filters[i] + 2);
     }
 }
@@ -382,6 +463,14 @@ int main(int argc, char **argv)
     sys_callbacks.open_dialog = open_dialog;
     parse_options(argc, argv, &args);
 
+#ifdef WIN32
+    if (args.register_assoc) {
+        register_file_associations();
+        if (!args.input && !args.script && !args.export)
+            return 0;
+    }
+#endif
+
     g_scale = args.scale;
 
     glfwSetErrorCallback(on_glfw_error);
@@ -428,8 +517,14 @@ int main(int argc, char **argv)
         tests_run();
     }
 
-    if (args.input)
-        goxel_import_file(args.input, NULL);
+    if (args.input) {
+        if (str_endswith(args.input, ".gox")) {
+            load_from_file(args.input, true);
+        } else {
+            // Non-.gox files: fresh workspace with the imported asset
+            goxel_import_file(args.input, NULL);
+        }
+    }
 
     if (args.script) {
         script_run_from_file(args.script, args.script_args_nb, args.script_args);

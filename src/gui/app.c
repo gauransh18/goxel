@@ -83,7 +83,7 @@ static struct {
 #if DEBUG
     [PANEL_DEBUG]       = {N_("Debug"), ICON_DEBUG, gui_debug_panel},
 #endif
-    [PANEL_SCRIPT_EDITOR] = {N_("Script Editor"), ICON_EXPORT, gui_script_editor_panel},
+    [PANEL_SCRIPT_EDITOR] = {N_("Script Editor"), ICON_TOOL_PROCEDURAL, gui_script_editor_panel},
 };
 
 typedef struct filter_layout_state filter_layout_state_t;

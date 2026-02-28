@@ -64,8 +64,13 @@ const file_format_t *file_format_get(
         if (need_write && !f->export_func) continue;
         if (name && strcasecmp(f->name, name) != 0) continue;
         if (!name && path) {
-            ext = f->exts[0] + 1; // Pick the string after '*'.
-            if (!endswith(path, ext)) continue;
+            int ext_i;
+            bool matched = false;
+            for (ext_i = 0; ext_i < 8 && f->exts[ext_i]; ext_i++) {
+                ext = f->exts[ext_i] + 1;
+                if (endswith(path, ext)) { matched = true; break; }
+            }
+            if (!matched) continue;
         }
         return f;
     }

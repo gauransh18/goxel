@@ -43,6 +43,12 @@ void script_iter_all(void *user, void (*f)(void *user, const char *name));
 int script_execute(const char *name);
 
 /*
+ * Get the scripts directory path (exe_dir/data/scripts).
+ * Returns 1 on success, 0 on failure.
+ */
+int script_get_dir(char *buf, size_t size);
+
+/*
  * Execute arbitrary JavaScript from a string.
  */
 int script_run_from_str(

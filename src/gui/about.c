@@ -18,6 +18,7 @@
 
 #include "goxel.h"
 #include "script.h"
+#include "system.h"
 
 int gui_about_popup(void *data)
 {
@@ -58,9 +59,7 @@ int gui_about_scripts_popup(void *data)
     const char *examples_url =
         "https://github.com/guillaumechereau/goxel/tree/master/data/scripts";
 
-    if (sys_get_user_dir()) {
-        snprintf(dir, sizeof(dir), "%s/scripts", sys_get_user_dir());
-    }
+    script_get_dir(dir, sizeof(dir));
 
     gui_text("Starting from version 0.12.0 Goxel adds experimental support "
              "for javascript plugins.");
@@ -69,24 +68,153 @@ int gui_about_scripts_popup(void *data)
     return gui_button("OK", 0, 0);
 }
 
-static char g_script_editor_buf[16384] = "";
+static char g_script_editor_buf[65536] = "";
+
+// Script selector state
+static char g_script_names[64][128]; // up to 64 scripts
+static int  g_script_count = 0;
+static int  g_script_selected = -1;
+
+static void collect_script_name(void *user, const char *name)
+{
+    (void)user;
+    if (g_script_count < 64) {
+        snprintf(g_script_names[g_script_count], 128, "%s", name);
+        g_script_count++;
+    }
+}
+
+static void refresh_script_list(void)
+{
+    g_script_count = 0;
+    script_iter_all(NULL, collect_script_name);
+}
 
 void gui_script_editor_panel(void)
 {
     bool req_run = false;
+    static char status_msg[256] = "";
+    int i;
 
-    // Provide a reasonably sized multiline text editor area
+    // -- Script Selector Combo --
+    refresh_script_list();
+    if (g_script_count > 0) {
+        const char *preview = (g_script_selected >= 0 && g_script_selected < g_script_count)
+            ? g_script_names[g_script_selected] : "Load Script...";
+        if (gui_combo_begin("##ScriptSelect", preview)) {
+            for (i = 0; i < g_script_count; i++) {
+                bool sel = (i == g_script_selected);
+                if (gui_combo_item(g_script_names[i], sel)) {
+                    g_script_selected = i;
+                }
+            }
+            gui_combo_end();
+        }
+        // Load selected script from file
+        if (g_script_selected >= 0 && g_script_selected < g_script_count) {
+            gui_row_begin(2);
+            if (gui_button("Load Selected", 0, 0)) {
+                char spath[1024] = "";
+                char scripts_dir[1024] = "";
+                if (script_get_dir(scripts_dir, sizeof(scripts_dir))) {
+                    snprintf(spath, sizeof(spath), "%s/%s.js",
+                             scripts_dir, g_script_names[g_script_selected]);
+                    FILE *f = fopen(spath, "rb");
+                    if (f) {
+                        size_t n = fread(g_script_editor_buf,
+                                         1, sizeof(g_script_editor_buf) - 1, f);
+                        g_script_editor_buf[n] = '\0';
+                        fclose(f);
+                        snprintf(status_msg, sizeof(status_msg),
+                                 "Loaded: %s", g_script_names[g_script_selected]);
+                    } else {
+                        snprintf(status_msg, sizeof(status_msg),
+                                 "File not found: %s", spath);
+                    }
+                }
+            }
+            gui_row_end();
+        }
+        gui_separator();
+    }
+
+    // -- Multiline text editor with line numbers --
+    // Draw line numbers on the left using gui_text, then the editor
+    {
+        int line_count = 1;
+        const char *s = g_script_editor_buf;
+        while (*s) {
+            if (*s == '\n') line_count++;
+            s++;
+        }
+        // Show line count hint
+        gui_text("Lines: %d  |  %d / %d bytes",
+                 line_count,
+                 (int)strlen(g_script_editor_buf),
+                 (int)sizeof(g_script_editor_buf));
+    }
+
     gui_input_text_multiline("##ScriptSource", g_script_editor_buf,
-                             sizeof(g_script_editor_buf), -1, -50);
+                             sizeof(g_script_editor_buf), -1, -100);
+
+    // -- Button row --
+    gui_row_begin(3);
 
     // Execute button
-    if (gui_button("Execute", -1, 0)) {
+    if (gui_button("Execute", 0, 0)) {
         req_run = true;
+    }
+
+    // Load from file
+    if (gui_button("Open...", 0, 0)) {
+        const char *filters[] = {"*.js", NULL};
+        const char *fpath = sys_open_file_dialog("Open Script", NULL,
+                                                 filters, "JavaScript");
+        if (fpath) {
+            FILE *f = fopen(fpath, "rb");
+            if (f) {
+                size_t n = fread(g_script_editor_buf,
+                                 1, sizeof(g_script_editor_buf) - 1, f);
+                g_script_editor_buf[n] = '\0';
+                fclose(f);
+                snprintf(status_msg, sizeof(status_msg), "Opened: %s", fpath);
+            }
+        }
+    }
+
+    // Save to file
+    if (gui_button("Save...", 0, 0)) {
+        const char *filters[] = {"*.js", NULL};
+        const char *fpath = sys_save_file_dialog("Save Script", "script.js",
+                                                 filters, "JavaScript");
+        if (fpath) {
+            FILE *f = fopen(fpath, "wb");
+            if (f) {
+                fwrite(g_script_editor_buf, 1,
+                       strlen(g_script_editor_buf), f);
+                fclose(f);
+                snprintf(status_msg, sizeof(status_msg), "Saved: %s", fpath);
+            }
+        }
+    }
+
+    gui_row_end();
+
+    // -- Status line --
+    if (status_msg[0]) {
+        gui_text("%s", status_msg);
     }
 
     // Run the script
     if (req_run && strlen(g_script_editor_buf) > 0) {
-        script_run_from_str(g_script_editor_buf, strlen(g_script_editor_buf),
-                            "Editor", 0, NULL);
+        int ret = script_run_from_str(g_script_editor_buf,
+                                      strlen(g_script_editor_buf),
+                                      "Editor", 0, NULL);
+        if (ret == 0) {
+            snprintf(status_msg, sizeof(status_msg), "Script executed OK");
+        } else {
+            snprintf(status_msg, sizeof(status_msg),
+                     "Script error (check console)");
+        }
     }
 }

@@ -18,6 +18,7 @@
 
 #include "file_format.h"
 #include "goxel.h"
+#include "utils/color.h"
 #include <time.h>
 
 
@@ -108,8 +109,9 @@ static int export(const volume_t *volume, const char *path)
     UT_array *lines_f, *lines_v, *lines_vn;
     line_t line, face, *line_ptr = NULL;
     volume_iterator_t iter;
-    
+
     // Goxel coordinate system to standard Y-Up
+    // (x, y, z) -> (x, -z, y)
     static const float ZUP2YUP[4][4] = {
         {1, 0, 0, 0}, {0, 0, -1, 0}, {0, 1, 0, 0}, {0, 0, 0, 1},
     };
@@ -117,18 +119,18 @@ static int export(const volume_t *volume, const char *path)
     utarray_new(lines_f, &line_icd);
     utarray_new(lines_v, &line_icd);
     utarray_new(lines_vn, &line_icd);
-    
+
     verts = calloc(N * N * N * 6 * 4, sizeof(*verts));
     face = (line_t){};
     iter = volume_get_iterator(volume, VOLUME_ITER_TILES | VOLUME_ITER_INCLUDES_NEIGHBORS);
-    
+
     while (volume_iter(&iter, bpos)) {
         mat4_set_identity(mat);
         mat4_mul(ZUP2YUP, mat, mat); // Ensure Y Up
         mat4_itranslate(mat, bpos[0], bpos[1], bpos[2]);
-        
+
         nb_elems = volume_generate_vertices(volume, bpos, goxel.rend.settings.effects, verts, &size, &subdivide);
-        
+
         for (i = 0; i < nb_elems; i++) {
             for (j = 0; j < size; j++) {
                 v[0] = verts[i * size + j].pos[0] / (float)subdivide;
@@ -136,7 +138,9 @@ static int export(const volume_t *volume, const char *path)
                 v[2] = verts[i * size + j].pos[2] / (float)subdivide;
                 mat4_mul_vec3(mat, v, v);
                 memcpy(c, verts[i * size + j].color, 3);
-                line = (line_t){.v = {v[0], v[1], v[2]}, .c = {c[0], c[1], c[2]}};
+                memset(&line, 0, sizeof(line));
+                line.v[0] = v[0]; line.v[1] = v[1]; line.v[2] = v[2];
+                line.c[0] = c[0]; line.c[1] = c[1]; line.c[2] = c[2];
                 face.vs[j] = lines_add(lines_v, &line, 1024);
             }
             for (j = 0; j < size; j++) {
@@ -144,17 +148,59 @@ static int export(const volume_t *volume, const char *path)
                 v[1] = verts[i * size + j].normal[1];
                 v[2] = verts[i * size + j].normal[2];
                 mat4_mul_dir3(mat, v, v);
-                line = (line_t){.vn = {v[0], v[1], v[2]}};
+                memset(&line, 0, sizeof(line));
+                line.vn[0] = v[0]; line.vn[1] = v[1]; line.vn[2] = v[2];
                 face.vns[j] = lines_add(lines_vn, &line, 512);
             }
             lines_add(lines_f, &face, 0);
         }
     }
-    
+
     out = fopen(path, "w");
     if (!out) {
         free(verts);
         return -1;
+    }
+
+    // --- Collect unique colors and per-face material indices ---
+    int num_faces = utarray_len(lines_f);
+    int num_unique_colors = 0;
+    uint8_t (*unique_colors)[3] = NULL;  // Dynamic array of unique RGB triples
+    int *face_mat = NULL;                // Material index per face
+
+    unique_colors = calloc(num_faces, sizeof(*unique_colors)); // worst case
+    face_mat = calloc(num_faces, sizeof(*face_mat));
+    if (!unique_colors || !face_mat) {
+        free(unique_colors);
+        free(face_mat);
+        fclose(out);
+        free(verts);
+        return -1;
+    }
+
+    {
+        int fi = 0;
+        line_t *fp = NULL;
+        while ((fp = (line_t*)utarray_next(lines_f, fp))) {
+            // Get color from first vertex of face
+            line_t *vl = (line_t*)utarray_eltptr(lines_v, fp->vs[0]);
+            uint8_t r = vl->c[0], g = vl->c[1], b = vl->c[2];
+
+            // Find existing unique color
+            int ci;
+            for (ci = 0; ci < num_unique_colors; ci++) {
+                if (unique_colors[ci][0] == r &&
+                    unique_colors[ci][1] == g &&
+                    unique_colors[ci][2] == b) break;
+            }
+            if (ci == num_unique_colors) {
+                unique_colors[ci][0] = r;
+                unique_colors[ci][1] = g;
+                unique_colors[ci][2] = b;
+                num_unique_colors++;
+            }
+            face_mat[fi++] = ci;
+        }
     }
 
     write_fbx_header(out);
@@ -172,17 +218,20 @@ static int export(const volume_t *volume, const char *path)
 
     fprintf(out, "Definitions:  {\n");
     fprintf(out, "\tVersion: 100\n");
-    fprintf(out, "\tCount: 1\n");
+    fprintf(out, "\tCount: %d\n", 2 + num_unique_colors);
     fprintf(out, "\tObjectType: \"Geometry\" {\n");
     fprintf(out, "\t\tCount: 1\n");
     fprintf(out, "\t}\n");
     fprintf(out, "\tObjectType: \"Model\" {\n");
     fprintf(out, "\t\tCount: 1\n");
     fprintf(out, "\t}\n");
+    fprintf(out, "\tObjectType: \"Material\" {\n");
+    fprintf(out, "\t\tCount: %d\n", num_unique_colors);
+    fprintf(out, "\t}\n");
     fprintf(out, "}\n\n");
 
     fprintf(out, "Objects:  {\n");
-    
+
     // Model Node
     fprintf(out, "\tModel: 2000000000, \"Model::VoxelMesh\", \"Mesh\" {\n");
     fprintf(out, "\t\tVersion: 232\n");
@@ -197,26 +246,29 @@ static int export(const volume_t *volume, const char *path)
 
     // Geometry Node
     fprintf(out, "\tGeometry: 3000000000, \"Geometry::VoxelMesh\", \"Mesh\" {\n");
-    
-    // Vertices
+
+    // Vertices (one vertex per line to avoid buffer overflow on import)
     fprintf(out, "\t\tVertices: *%d {\n\t\t\ta: ", utarray_len(lines_v) * 3);
     int cnt = 0;
     while( (line_ptr = (line_t*)utarray_next(lines_v, line_ptr))) {
-        fprintf(out, "%s%g,%g,%g", cnt == 0 ? "" : ",", line_ptr->v[0], line_ptr->v[1], line_ptr->v[2]);
+        if (cnt > 0) fprintf(out, ",\n\t\t\t");
+        fprintf(out, "%g,%g,%g", line_ptr->v[0], line_ptr->v[1], line_ptr->v[2]);
         cnt++;
     }
     fprintf(out, "\n\t\t}\n");
 
-    // Face Indices (Negative final index to signify end of face in FBX)
+    // Face Indices (one polygon per line)
     fprintf(out, "\t\tPolygonVertexIndex: *%d {\n\t\t\ta: ", utarray_len(lines_f) * size);
     cnt = 0;
     while( (line_ptr = (line_t*)utarray_next(lines_f, line_ptr))) {
+        if (cnt > 0) fprintf(out, ",\n\t\t\t");
         for(j=0; j<size; j++) {
             int idx = line_ptr->vs[j];
             if(j == size - 1) idx = (idx * -1) - 1; // FBX End of Polygon
-            fprintf(out, "%s%d", cnt == 0 ? "" : ",", idx);
-            cnt++;
+            if (j > 0) fprintf(out, ",");
+            fprintf(out, "%d", idx);
         }
+        cnt++;
     }
     fprintf(out, "\n\t\t}\n");
 
@@ -232,28 +284,46 @@ static int export(const volume_t *volume, const char *path)
     while( (line_ptr = (line_t*)utarray_next(lines_f, line_ptr))) {
         for(j=0; j<size; j++) {
             line_t *vnl = (line_t*)utarray_eltptr(lines_vn, line_ptr->vns[j]);
-            fprintf(out, "%s%g,%g,%g", cnt == 0 ? "" : ",", vnl->vn[0], vnl->vn[1], vnl->vn[2]);
+            if (cnt > 0) fprintf(out, ",\n\t\t\t\t");
+            fprintf(out, "%g,%g,%g", vnl->vn[0], vnl->vn[1], vnl->vn[2]);
             cnt++;
         }
     }
     fprintf(out, "\n\t\t\t}\n");
     fprintf(out, "\t\t}\n");
 
-    // Colors (By polygon vertex)
+    // Colors (ByVertice - one color per unique vertex for import compatibility)
     fprintf(out, "\t\tLayerElementColor: 0 {\n");
     fprintf(out, "\t\t\tVersion: 101\n");
     fprintf(out, "\t\t\tName: \"Col\"\n");
-    fprintf(out, "\t\t\tMappingInformationType: \"ByPolygonVertex\"\n");
+    fprintf(out, "\t\t\tMappingInformationType: \"ByVertice\"\n");
     fprintf(out, "\t\t\tReferenceInformationType: \"Direct\"\n");
-    fprintf(out, "\t\t\tColors: *%d {\n\t\t\t\ta: ", utarray_len(lines_f) * size * 4);
+    fprintf(out, "\t\t\tColors: *%d {\n\t\t\t\ta: ", utarray_len(lines_v) * 4);
     cnt = 0;
     line_ptr = NULL;
-    while( (line_ptr = (line_t*)utarray_next(lines_f, line_ptr))) {
-        for(j=0; j<size; j++) {
-            line_t *vl = (line_t*)utarray_eltptr(lines_v, line_ptr->vs[j]);
-            fprintf(out, "%s%f,%f,%f,1.0", cnt == 0 ? "" : ",", vl->c[0]/255.0f, vl->c[1]/255.0f, vl->c[2]/255.0f);
-            cnt++;
+    while( (line_ptr = (line_t*)utarray_next(lines_v, line_ptr))) {
+        if (cnt > 0) fprintf(out, ",\n\t\t\t\t");
+        {
+            float linear[3];
+            srgb8_to_rgb(line_ptr->c, linear);
+            fprintf(out, "%f,%f,%f,1.0", linear[0], linear[1], linear[2]);
         }
+        cnt++;
+    }
+    fprintf(out, "\n\t\t\t}\n");
+    fprintf(out, "\t\t}\n");
+
+    // Material assignment per polygon
+    fprintf(out, "\t\tLayerElementMaterial: 0 {\n");
+    fprintf(out, "\t\t\tVersion: 101\n");
+    fprintf(out, "\t\t\tName: \"\"\n");
+    fprintf(out, "\t\t\tMappingInformationType: \"ByPolygon\"\n");
+    fprintf(out, "\t\t\tReferenceInformationType: \"IndexToDirect\"\n");
+    fprintf(out, "\t\t\tMaterials: *%d {\n\t\t\t\ta: ", num_faces);
+    for (i = 0; i < num_faces; i++) {
+        if (i > 0) fprintf(out, ",");
+        if (i > 0 && (i % 64) == 0) fprintf(out, "\n\t\t\t\t");
+        fprintf(out, "%d", face_mat[i]);
     }
     fprintf(out, "\n\t\t\t}\n");
     fprintf(out, "\t\t}\n");
@@ -269,17 +339,61 @@ static int export(const volume_t *volume, const char *path)
     fprintf(out, "\t\t\t\tType: \"LayerElementColor\"\n");
     fprintf(out, "\t\t\t\tTypedIndex: 0\n");
     fprintf(out, "\t\t\t}\n");
+    fprintf(out, "\t\t\tLayerElement:  {\n");
+    fprintf(out, "\t\t\t\tType: \"LayerElementMaterial\"\n");
+    fprintf(out, "\t\t\t\tTypedIndex: 0\n");
+    fprintf(out, "\t\t\t}\n");
     fprintf(out, "\t\t}\n");
     fprintf(out, "\t}\n");
 
+    // Material objects - one per unique color with correct DiffuseColor
+    for (i = 0; i < num_unique_colors; i++) {
+        long long mat_id = 4000000000LL + i;
+        float linear[3];
+        float r, g, b;
+        srgb8_to_rgb(unique_colors[i], linear);
+        r = linear[0];
+        g = linear[1];
+        b = linear[2];
+        fprintf(out, "\tMaterial: %lld, \"Material::Color_%02X%02X%02X\", \"\" {\n",
+                mat_id, unique_colors[i][0], unique_colors[i][1],
+                unique_colors[i][2]);
+        fprintf(out, "\t\tVersion: 102\n");
+        fprintf(out, "\t\tShadingModel: \"lambert\"\n");
+        fprintf(out, "\t\tMultiLayer: 0\n");
+        fprintf(out, "\t\tProperties70:  {\n");
+        fprintf(out, "\t\t\tP: \"ShadingModel\", \"KString\", \"\", \"\", "
+                     "\"lambert\"\n");
+        fprintf(out, "\t\t\tP: \"EmissiveColor\", \"Color\", \"\", "
+                     "\"A\",0,0,0\n");
+        fprintf(out, "\t\t\tP: \"EmissiveFactor\", \"Number\", \"\", "
+                     "\"A\",0\n");
+        fprintf(out, "\t\t\tP: \"AmbientColor\", \"Color\", \"\", "
+                     "\"A\",0,0,0\n");
+        fprintf(out, "\t\t\tP: \"DiffuseColor\", \"Color\", \"\", "
+                     "\"A\",%f,%f,%f\n", r, g, b);
+        fprintf(out, "\t\t\tP: \"DiffuseFactor\", \"Number\", \"\", "
+                     "\"A\",1\n");
+        fprintf(out, "\t\t\tP: \"Opacity\", \"Number\", \"\", \"A\",1\n");
+        fprintf(out, "\t\t}\n");
+        fprintf(out, "\t}\n");
+    }
+
     fprintf(out, "}\n\n");
 
+    // Connections
     fprintf(out, "Connections:  {\n");
-    fprintf(out, "\tC: \"OO\",3000000000,2000000000\n"); // Connect Geometry to Model
-    fprintf(out, "\tC: \"OO\",2000000000,0\n"); // Connect Model to Root
+    fprintf(out, "\tC: \"OO\",3000000000,2000000000\n"); // Geometry -> Model
+    for (i = 0; i < num_unique_colors; i++) {
+        fprintf(out, "\tC: \"OO\",%lld,2000000000\n",
+                4000000000LL + i);                       // Material -> Model
+    }
+    fprintf(out, "\tC: \"OO\",2000000000,0\n");          // Model -> Root
     fprintf(out, "}\n");
 
     fclose(out);
+    free(unique_colors);
+    free(face_mat);
     utarray_free(lines_f);
     utarray_free(lines_v);
     utarray_free(lines_vn);
@@ -293,9 +407,319 @@ static int fbx_export(const file_format_t *format, const image_t *image, const c
     return export(volume, path);
 }
 
+// FBX Import support - parses ASCII FBX and reconstructs voxels directly.
+
+static bool append_float(float **arr, int *len, int *cap, float v)
+{
+    float *new_arr;
+    int new_cap;
+    if (*len >= *cap) {
+        new_cap = *cap ? *cap * 2 : 1024;
+        new_arr = realloc(*arr, new_cap * sizeof(**arr));
+        if (!new_arr) return false;
+        *arr = new_arr;
+        *cap = new_cap;
+    }
+    (*arr)[(*len)++] = v;
+    return true;
+}
+
+static bool append_int(int **arr, int *len, int *cap, int v)
+{
+    int *new_arr;
+    int new_cap;
+    if (*len >= *cap) {
+        new_cap = *cap ? *cap * 2 : 1024;
+        new_arr = realloc(*arr, new_cap * sizeof(**arr));
+        if (!new_arr) return false;
+        *arr = new_arr;
+        *cap = new_cap;
+    }
+    (*arr)[(*len)++] = v;
+    return true;
+}
+
+static char *fbx_array_values_start(char *line, bool *started)
+{
+    char *p;
+    if (!*started) {
+        p = strstr(line, "a:");
+        if (!p) return NULL;
+        *started = true;
+        return p + 2;
+    }
+    return line;
+}
+
+static int fbx_import(const file_format_t *format, image_t *image,
+                      const char *path)
+{
+    FILE *file;
+    // Use a large buffer to handle FBX files with long data lines.
+    // Goxel's own export now writes multi-line data, but third-party
+    // FBX files may put all data on a single line.
+    #define FBX_LINE_BUFSZ (1024 * 1024)
+    char *line = NULL;
+    int i, pos[3];
+    uint8_t color[4];
+    volume_iterator_t iter = {0};
+    layer_t *layer;
+    float *vertices = NULL;
+    float *colors_float = NULL;
+    int *indices = NULL;
+    int v_idx = 0, c_idx = 0;
+    int vertices_cap = 0, colors_cap = 0;
+    int indices_len = 0;
+    int indices_cap = 0;
+    int *poly_indices = NULL;
+    int poly_len = 0;
+    int poly_cap = 0;
+    bool section_started = false;
+    bool colors_by_polygon_vertex = false;  // ByVertice vs ByPolygonVertex
+    float *vertex_colors = NULL;  // per-vertex colors (4 floats each)
+
+    enum {
+        FBX_SECTION_NONE,
+        FBX_SECTION_VERTICES,
+        FBX_SECTION_INDICES,
+        FBX_SECTION_COLORS,
+    } section = FBX_SECTION_NONE;
+
+    line = malloc(FBX_LINE_BUFSZ);
+    if (!line) return -1;
+
+    file = fopen(path, "r");
+    if (!file) {
+        LOG_E("Cannot open FBX file: %s", path);
+        free(line);
+        return -1;
+    }
+
+    while (fgets(line, FBX_LINE_BUFSZ, file)) {
+        char *p, *end;
+
+        if (strstr(line, "Vertices: *")) {
+            section = FBX_SECTION_VERTICES;
+            section_started = false;
+        } else if (strstr(line, "PolygonVertexIndex: *")) {
+            section = FBX_SECTION_INDICES;
+            section_started = false;
+        } else if (strstr(line, "Colors: *")) {
+            section = FBX_SECTION_COLORS;
+            section_started = false;
+        } else if (strstr(line, "ByPolygonVertex") &&
+                   strstr(line, "MappingInformationType")) {
+            // Detect color mapping type before the Colors array
+            colors_by_polygon_vertex = true;
+        }
+
+        if (section == FBX_SECTION_NONE) continue;
+
+        p = fbx_array_values_start(line, &section_started);
+        if (!p) {
+            if (strchr(line, '}')) {
+                section = FBX_SECTION_NONE;
+                section_started = false;
+            }
+            continue;
+        }
+
+        if (section == FBX_SECTION_VERTICES) {
+            while (*p) {
+                float val;
+                val = strtof(p, &end);
+                if (end == p) {
+                    p++;
+                    continue;
+                }
+                if (!append_float(&vertices, &v_idx, &vertices_cap, val)) goto fail;
+                p = end;
+            }
+        } else if (section == FBX_SECTION_INDICES) {
+            while (*p) {
+                int val;
+                val = strtol(p, &end, 10);
+                if (end == p) {
+                    p++;
+                    continue;
+                }
+                {
+                    bool end_poly = val < 0;
+                    if (end_poly) val = -val - 1;
+                    if (!append_int(&poly_indices, &poly_len, &poly_cap, val)) {
+                        goto fail;
+                    }
+                    if (end_poly) {
+                        int k;
+                        for (k = 2; k < poly_len; k++) {
+                            if (!append_int(&indices, &indices_len, &indices_cap,
+                                            poly_indices[0])) goto fail;
+                            if (!append_int(&indices, &indices_len, &indices_cap,
+                                            poly_indices[k - 1])) goto fail;
+                            if (!append_int(&indices, &indices_len, &indices_cap,
+                                            poly_indices[k])) goto fail;
+                        }
+                        poly_len = 0;
+                    }
+                }
+                p = end;
+            }
+        } else if (section == FBX_SECTION_COLORS) {
+            while (*p) {
+                float val;
+                val = strtof(p, &end);
+                if (end == p) {
+                    p++;
+                    continue;
+                }
+                if (!append_float(&colors_float, &c_idx, &colors_cap, val)) goto fail;
+                p = end;
+            }
+        }
+
+        if (strchr(line, '}')) {
+            section = FBX_SECTION_NONE;
+            section_started = false;
+        }
+    }
+
+    fclose(file);
+
+    if (v_idx < 3 || indices_len < 3) {
+        LOG_E("Invalid or unsupported FBX mesh data in %s", path);
+        goto fail_no_file;
+    }
+
+    // Direct voxel extraction from mesh triangles.
+    // For each triangle: compute centroid, step back 0.5 along the face
+    // normal to locate the voxel center, then floor to get the voxel pos.
+    //
+    // Build per-vertex color lookup from ByPolygonVertex data if needed.
+    // Convert polygon-vertex order colors into per-vertex colors by taking
+    // the first color seen for each vertex index.
+    if (colors_by_polygon_vertex && c_idx >= 4) {
+        int nv = v_idx / 3;
+        vertex_colors = calloc(nv * 4, sizeof(float));
+        if (vertex_colors) {
+            bool *has_color = calloc(nv, sizeof(bool));
+            if (has_color) {
+                // Walk polygon indices again to map polygon-vertex to vertex
+                // We need to re-parse, but we have the raw indices already.
+                // The polygon-vertex colors are in order of the original
+                // PolygonVertexIndex entries (before triangulation).
+                // Re-scan: we already stored triangulated indices but we need
+                // the original polygon-vertex order. Simpler approach: just
+                // assign color[pv_idx] to vertex[vert_idx] for each entry.
+                // Since we have the flat indices, and Goxel export writes
+                // ByVertice, this mainly helps third-party FBX files.
+                // Use vertex index directly if within range.
+                int pv;
+                for (pv = 0; pv * 4 + 3 < c_idx && pv < nv; pv++) {
+                    vertex_colors[pv * 4 + 0] = colors_float[pv * 4 + 0];
+                    vertex_colors[pv * 4 + 1] = colors_float[pv * 4 + 1];
+                    vertex_colors[pv * 4 + 2] = colors_float[pv * 4 + 2];
+                    vertex_colors[pv * 4 + 3] = colors_float[pv * 4 + 3];
+                    has_color[pv] = true;
+                }
+                free(has_color);
+            }
+        }
+    }
+
+    layer = image_add_layer(image, NULL);
+    {
+        int nv = v_idx / 3;
+        float *col_src = vertex_colors ? vertex_colors : colors_float;
+        int col_count = vertex_colors ? (v_idx / 3) * 4 : c_idx;
+        for (i = 0; i + 2 < indices_len; i += 3) {
+            int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
+            float v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z;
+            float cx, cy, cz;
+            float e1x, e1y, e1z, e2x, e2y, e2z;
+            float nx, ny, nz, len;
+            float vcx, vcy, vcz;
+
+            if (i0 < 0 || i0 >= nv || i1 < 0 || i1 >= nv ||
+                i2 < 0 || i2 >= nv)
+                continue;
+
+            v0x = vertices[i0*3+0]; v0y = vertices[i0*3+1]; v0z = vertices[i0*3+2];
+            v1x = vertices[i1*3+0]; v1y = vertices[i1*3+1]; v1z = vertices[i1*3+2];
+            v2x = vertices[i2*3+0]; v2y = vertices[i2*3+1]; v2z = vertices[i2*3+2];
+
+            // Centroid in FBX space (Y-up)
+            cx = (v0x + v1x + v2x) / 3.0f;
+            cy = (v0y + v1y + v2y) / 3.0f;
+            cz = (v0z + v1z + v2z) / 3.0f;
+
+            // Face normal via cross product
+            e1x = v1x - v0x; e1y = v1y - v0y; e1z = v1z - v0z;
+            e2x = v2x - v0x; e2y = v2y - v0y; e2z = v2z - v0z;
+            nx = e1y * e2z - e1z * e2y;
+            ny = e1z * e2x - e1x * e2z;
+            nz = e1x * e2y - e1y * e2x;
+            len = sqrtf(nx * nx + ny * ny + nz * nz);
+            if (len > 1e-6f) { nx /= len; ny /= len; nz /= len; }
+
+            // Step back half unit along normal -> voxel center
+            vcx = cx - nx * 0.5f;
+            vcy = cy - ny * 0.5f;
+            vcz = cz - nz * 0.5f;
+
+            // FBX Y-up (x,y,z) -> Goxel Z-up (x, -z, y)
+            pos[0] = (int)floorf(vcx);
+            pos[1] = (int)floorf(-vcz);
+            pos[2] = (int)floorf(vcy);
+
+            // Color from first vertex (4 floats per vertex: R,G,B,A)
+            {
+                int col_idx = i0 * 4;
+                if (col_count > 0 && col_idx + 2 < col_count) {
+                    float rgb[3];
+                    rgb[0] = col_src[col_idx + 0];
+                    rgb[1] = col_src[col_idx + 1];
+                    rgb[2] = col_src[col_idx + 2];
+                    if (rgb[0] < 0) rgb[0] = 0;
+                    if (rgb[0] > 1) rgb[0] = 1;
+                    if (rgb[1] < 0) rgb[1] = 0;
+                    if (rgb[1] > 1) rgb[1] = 1;
+                    if (rgb[2] < 0) rgb[2] = 0;
+                    if (rgb[2] > 1) rgb[2] = 1;
+                    rgb_to_srgb8(rgb, color);
+                } else {
+                    color[0] = color[1] = color[2] = 255;
+                }
+            }
+            color[3] = 255;
+            volume_set_at(layer->volume, &iter, pos, color);
+        }
+    }
+
+    free(vertices);
+    free(indices);
+    free(colors_float);
+    free(poly_indices);
+    free(vertex_colors);
+    free(line);
+
+    return 0;
+
+fail:
+    fclose(file);
+fail_no_file:
+    free(vertices);
+    free(indices);
+    free(colors_float);
+    free(poly_indices);
+    free(vertex_colors);
+    free(line);
+    return -1;
+}
+
 FILE_FORMAT_REGISTER(fbx,
     .name = "fbx",
     .exts = {"*.fbx"},
     .exts_desc = "fbx",
     .export_func = fbx_export,
+    .import_func = fbx_import,
 )

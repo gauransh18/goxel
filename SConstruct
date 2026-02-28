@@ -63,9 +63,12 @@ if env['mode'] == 'debug' and target_os == 'posix':
 # CCFLAGS   : C and C++
 # CFLAGS    : only C
 # CXXFLAGS  : only C++
+base_cflags = ['-std=gnu99', '-Wall', '-Wno-unknown-pragmas']
+if os.environ.get('CC') == 'clang':
+    base_cflags.append('-Wno-unknown-warning-option')
+
 env.Append(
-    CFLAGS=['-std=gnu99', '-Wall',
-            '-Wno-unknow-pragma', '-Wno-unknown-warning-option'],
+    CFLAGS=base_cflags,
     CXXFLAGS=['-std=gnu++17', '-Wall', '-Wno-narrowing']
 )
 
@@ -115,6 +118,7 @@ if target_os == 'posix':
 if target_os == 'msys' or target_os == 'cygwin':
     env.Append(CXXFLAGS=['-Wno-attributes', '-Wno-unused-variable',
                          '-Wno-unused-function'])
+    env.Append(CFLAGS=['-Wno-address'])
     env.Append(CCFLAGS=['-Wno-error=address']) # To remove if possible.
     env.Append(LIBS=['glfw3', 'opengl32', 'z', 'tre', 'gdi32', 'Comdlg32',
                      'ole32', 'uuid', 'shell32'],

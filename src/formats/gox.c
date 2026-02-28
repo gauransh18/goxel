@@ -727,14 +727,24 @@ static void a_open(void)
 {
     char default_save_path[1024];
     const char *path;
-    const char *filters[] = {"*.gox", NULL};
+    const char *filters[] = {"*.gox", "*.gltf", "*.glb", "*.fbx", "*.obj",
+                              "*.ply", "*.vox", "*.qb", NULL};
 
     get_default_save_path(default_save_path, sizeof(default_save_path));
-    path = sys_open_file_dialog("Open", default_save_path, filters, "gox");
+    path = sys_open_file_dialog("Open", default_save_path, filters,
+                                "All Supported");
     if (!path) return;
-    image_delete(goxel.image);
-    goxel.image = image_new();
-    load_from_file(path, true);
+
+    if (str_endswith(path, ".gox")) {
+        image_delete(goxel.image);
+        goxel.image = image_new();
+        load_from_file(path, true);
+    } else {
+        // Non-.gox files: create fresh workspace and import
+        image_delete(goxel.image);
+        goxel.image = image_new();
+        goxel_import_file(path, NULL);
+    }
     goxel_add_recent_file(path);
 }
 
@@ -771,6 +781,14 @@ static void a_save(void)
     char default_save_path[1024];
     const char *path = goxel.image->path;
     const char *filters[] = {"*.gox", NULL};
+
+    // If the file was opened from a non-.gox format (e.g. .fbx, .gltf),
+    // save (export) back to the original format directly.
+    if (!path && goxel.image->export_path && goxel.image->export_fmt) {
+        goxel_export_to_file(goxel.image->export_path, NULL);
+        goxel.image->saved_key = image_get_key(goxel.image);
+        return;
+    }
 
     if (!path) {
         get_default_save_path(default_save_path, sizeof(default_save_path));
